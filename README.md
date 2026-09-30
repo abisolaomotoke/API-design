@@ -392,23 +392,23 @@ All entity IDs are UUIDs rather than sequential numbers. UUIDs make IDs harder t
 
 Idempotency
 
-Product creation uses an idempotency key to prevent duplicate products.
+Product creation and order placement use an idempotency key to prevent duplicate products.
 
 The API stores:
 
 Field| Type| Purpose
-sellerId| UUID| Seller who made the request
+userId| UUID| User who made the request
 key| string| Idempotency key
 requestHash| string| Hash of the request body
 storedStatus| integer| Original response status
 storedResponse| JSON| Original response body
 createdAt| timestamp| When the record was created
 
-There is a unique constraint on "sellerId + key".
+There is a unique constraint on "userId + key".
 
 The idempotency record and product are created in one database transaction.
 
-If two identical requests arrive at the same time, the unique "sellerId + key" constraint prevents both requests from creating the same product. The second request returns "409 REQUEST_IN_PROGRESS", or waits for the first transaction to finish and then returns the stored response.
+If two identical requests arrive at the same time, the unique "userId + key" constraint prevents both requests from creating the same product. The second request returns "409 REQUEST_IN_PROGRESS", or waits for the first transaction to finish and then returns the stored response.
 
 A retry using the same key and the same request body returns the original response with the same status and body.
 
@@ -458,7 +458,7 @@ Status| Code| When
 400| "MALFORMED_JSON"| Request body is not valid JSON.
 401| "UNAUTHENTICATED"| User is not logged in or token is invalid.
 403| "FORBIDDEN"| Logged-in user is not a seller.
-409| "REQUEST_IN_PROGRESS"| Another request with the same seller and idempotency key is currently being processed.
+409| "REQUEST_IN_PROGRESS"| Another request with the same user and idempotency key is currently being processed.
 422| "VALIDATION_ERROR"| A required field is missing or has an invalid value.
 422| "IDEMPOTENCY_KEY_REUSED"| Same key was used with a different request body.
 
@@ -638,4 +638,148 @@ Product Availability Decisions
 
 2. Exact stock visibility: The public detail page shows only "inStock", not the exact "stockQuantity" for each colour. "totalStock" is still shown because the requirements require overall stock availability.
 
+### POST /api/v1/cart/items
+
+Adds a product colour to the buyer's cart (Action 3).
+
+**Who can call it:** Authenticated buyers only.
+
+**Headers:**
+
+| Header | Required? | Description |
+|---|---|---|
+| Authorization | Yes | Login token used to identify the buyer |
+
+**Request body:**
+
+| Field | Type | Required? |
+|---|---|---|
+| productColourId | UUID | Yes |
+| quantity | integer | Yes (whole number, 1 or more) |
+
+`buyerId` is taken from the login token, never from the request body.
+
+If the buyer has no cart yet, the API creates one (one cart per buyer).
+
+**If the colour is already in the cart:** the API adds the new quantity to the existing quantity instead of returning an error. Reason: a buyer who taps "Add to cart" twice expects two items, and an error would be confusing. The combined quantity must still be within available stock.
+
+**Stock check:** this check is only a friendly early warning. The real, final stock check happens when the order is placed (see `POST /api/v1/orders`).
+
+**Success response:** `201 Created` when a new cart item is created, `200 OK` when the quantity is added to an existing one.
+
+```json
+{
+  "data": {
+    "id": "5c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f",
+    "cartId": "8a7b6c5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d",
+    "productColourId": "2b3c4d5e-6f7a-8b9c-0d11-12e13f14a15b",
+    "productName": "Large Tote Bag",
+    "colour": "Blue",
+    "unitPrice": 8500000,
+    "currency": "NGN",
+    "quantity": 2,
+    "createdAt": "2026-09-30T10:00:00Z",
+    "updatedAt": "2026-09-30T10:00:00Z"
+  },
+  "meta": {}
+}
+```
+
+**Errors:**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | MALFORMED_JSON | Request body is not valid JSON. |
+| 401 | UNAUTHENTICATED | User is not logged in or token is invalid. |
+| 403 | FORBIDDEN | Logged-in user is not a buyer. |
+| 404 | NOT_FOUND | The product colour does not exist, or it or its product has been soft-deleted. |
+| 409 | OUT_OF_STOCK | The colour has 0 stock. |
+| 409 | INSUFFICIENT_STOCK | The total quantity (existing in cart plus new) is more than the available stock. |
+| 422 | VALIDATION_ERROR | `productColourId` is missing or not a valid UUID, or `quantity` is missing or not a whole number of 1 or more. The message names the field. |
+
+**Idempotent?** No, and that is deliberate. Sending the same request twice adds the quantity twice. This is acceptable because a cart is low-risk: nothing is charged and the buyer can correct the quantity. Exact quantity changes are handled by a separate endpoint that sets the quantity (`PATCH /api/v1/cart/items/:id`), which is idempotent because it sets a value instead of adding to it.
+
+---
+
+### POST /api/v1/orders
+
+Turns the buyer's cart into an order (Action 4).
+
+**Who can call it:** Authenticated buyers only.
+
+**Headers:**
+
+| Header | Required? | Description |
+|---|---|---|
+| Authorization | Yes | Login token used to identify the buyer |
+| Idempotency-Key | Yes | Unique key for this order attempt |
+
+**Request body:**
+
+| Field | Type | Required? |
+|---|---|---|
+| deliveryAddress | string | Yes |
+
+The items are not sent in the request. They come from the buyer's cart, so a buyer cannot send fake prices or quantities.
+
+**What the API does, in this order, inside ONE database transaction:**
+
+1. Find the buyer's cart items. If there are none, stop with `CART_EMPTY`.
+2. For each cart item, reduce stock with one atomic update that only succeeds if enough stock is left (`stockQuantity >= quantity`). If any update changes nothing, stop and roll back everything, and return `OUT_OF_STOCK` naming that item.
+3. Create the Order with status `pending`, the `deliveryAddress` copied onto it, and the currency.
+4. For each cart item, create an Order Item with status `pending`. Copy `productName`, `colourName`, `unitPrice` (the price right now), `quantity` and `sellerId` onto it.
+5. Calculate `total` in kobo by adding `unitPrice x quantity` for every Order Item, and save it on the Order.
+6. Delete the buyer's cart items.
+
+If any step fails, nothing is saved: no order, no stock change, and the cart stays as it was. This is what "all or nothing" means.
+
+**Payment:** placing an order does not take payment. The order starts as `pending`, and payment is a separate step that moves it to `paid`.
+
+**Unpaid orders:** a `pending` order holds its stock. An order that is still `pending` after 30 minutes is cancelled automatically, and its quantities go back to stock, so unpaid orders cannot lock stock forever.
+
+**Success response:** `201 Created`
+
+```json
+{
+  "data": {
+    "id": "c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8",
+    "buyerId": "6f5e4d3c-2b1a-4f9e-8d7c-6b5a4f3e2d1c",
+    "status": "pending",
+    "total": 17000000,
+    "currency": "NGN",
+    "deliveryAddress": "12 Allen Avenue, Ikeja, Lagos",
+    "items": [
+      {
+        "id": "d5e6f7a8-b9c0-4d1e-a2f3-a4b5c6d7e8f9",
+        "productName": "Large Tote Bag",
+        "colourName": "Blue",
+        "unitPrice": 8500000,
+        "quantity": 2,
+        "status": "pending"
+      }
+    ],
+    "createdAt": "2026-09-30T10:05:00Z",
+    "updatedAt": "2026-09-30T10:05:00Z"
+  },
+  "meta": {}
+}
+```
+
+**Errors:**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | IDEMPOTENCY_KEY_REQUIRED | The `Idempotency-Key` header is missing. |
+| 400 | MALFORMED_JSON | Request body is not valid JSON. |
+| 401 | UNAUTHENTICATED | User is not logged in or token is invalid. |
+| 403 | FORBIDDEN | Logged-in user is not a buyer. |
+| 409 | CART_EMPTY | The buyer's cart has no items. |
+| 409 | OUT_OF_STOCK | At least one colour does not have enough stock. The message names the product and colour, e.g. "Large Tote Bag (Blue) does not have enough stock". |
+| 409 | REQUEST_IN_PROGRESS | Another request with the same buyer and idempotency key is still being processed. |
+| 422 | VALIDATION_ERROR | `deliveryAddress` is missing or empty. The message names the field. |
+| 422 | IDEMPOTENCY_KEY_REUSED | The same key was used with a different request body. |
+
+**Idempotent?** Yes, using the `Idempotency-Key` header, with the same rules as product creation: a retry with the same key and body returns the original response and does not create a second order, and a key used with a different body returns `IDEMPOTENCY_KEY_REUSED`. Because buyers now use this too, rename the `sellerId` column in the idempotency table to `userId`, and keep the unique constraint on `userId + key`.
+
+**Why this matters:** without the key, a buyer who double-clicks "Place order" could get two orders and have stock reduced twice.
 ## Schema Proof
