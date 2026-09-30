@@ -211,7 +211,7 @@ Order statuses are:
 Allowed transitions:
 - "pending → paid": payment succeeds.
 - "pending → cancelled": buyer cancels before payment.
-- "paid → shipped": all Order Items have been shipped.
+- "paid → shipped": all Order Items are shipped or delivered.
 - "paid → cancelled": allowed with a refund if the order cannot be fulfilled before shipping.
 - "shipped → delivered": all Order Items have been delivered.
 
@@ -782,4 +782,95 @@ If any step fails, nothing is saved: no order, no stock change, and the cart sta
 **Idempotent?** Yes, using the `Idempotency-Key` header, with the same rules as product creation: a retry with the same key and body returns the original response and does not create a second order, and a key used with a different body returns `IDEMPOTENCY_KEY_REUSED`. Because buyers now use this too, rename the `sellerId` column in the idempotency table to `userId`, and keep the unique constraint on `userId + key`.
 
 **Why this matters:** without the key, a buyer who double-clicks "Place order" could get two orders and have stock reduced twice.
+
+### PATCH /api/v1/order-items/:id
+
+A seller updates the status of one of their own order items (Action 5). This moves the item from `paid` to `shipped`, and later from `shipped` to `delivered`.
+
+**Who can call it:** Authenticated sellers only, and only for order items that belong to them (`OrderItem.sellerId` matches the seller in the login token).
+
+**Headers:**
+
+| Header | Required? | Description |
+|---|---|---|
+| Authorization | Yes | Login token used to identify the seller |
+
+**Path parameter:**
+
+| Parameter | Type | Required? |
+|---|---|---|
+| id | UUID | Yes |
+
+**Request body:**
+
+| Field | Type | Required? |
+|---|---|---|
+| status | enum: "shipped", "delivered" | Yes |
+
+**Allowed item transitions:**
+
+| From | To | Meaning |
+|---|---|---|
+| paid | shipped | The seller has sent the item out. |
+| shipped | delivered | The item has reached the buyer. |
+
+Everything else is forbidden. For example: `pending → shipped` (the order is unpaid), `paid → delivered` (skips shipped), `delivered → shipped` (cannot go backwards), and anything from `cancelled`.
+
+**Item statuses are set earlier by other actions:** an item starts as `pending` when the order is placed. When payment succeeds, the API sets the order to `paid` and all its items to `paid` in one transaction. This endpoint only handles what happens after that.
+
+**What the API does, in this order, inside ONE database transaction:**
+
+1. Lock the parent order row, so two sellers updating items of the same order at the same moment take turns (see the race condition below).
+2. Find the order item. If it does not exist, or belongs to another seller, stop with `NOT_FOUND`.
+3. If the requested status is the same as the current status, change nothing and return the current state (this is what makes the endpoint idempotent).
+4. Check the transition is allowed. If not, stop with `INVALID_TRANSITION`.
+5. Update the item's status and `updatedAt`.
+6. Read all items of that order and decide the order status:
+   - If every item is `shipped` or `delivered`, and the order is `paid`, set the order to `shipped`.
+   - If every item is `delivered`, set the order to `delivered`.
+   - Otherwise the order status stays as it is (for example it stays `paid` while some items have not shipped).
+
+If any step fails, nothing is saved.
+
+**Note on the order status rule:** an order becomes `shipped` when every item has been shipped, including items that are already delivered. This fixes the case where one seller ships and delivers quickly before another seller has shipped.
+
+**Race condition and how it is prevented:** two sellers ship the last two items of the same order at the same moment. Without a lock, both transactions could read the other item as "not shipped yet", and the order would never move to `shipped`. Locking the order row in step 1 makes the second transaction wait until the first has finished, so it then sees the first item as shipped and updates the order correctly.
+
+**Why a seller who does not own the item gets 404, not 403:** a `403` would confirm that the item exists. A `404` reveals nothing about other sellers' orders.
+
+**Success response:** `200 OK`
+
+```json
+{
+  "data": {
+    "id": "d5e6f7a8-b9c0-4d1e-a2f3-a4b5c6d7e8f9",
+    "orderId": "c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8",
+    "sellerId": "7a2b3c4d-5e6f-7a8b-9c10-11d12e13f14a",
+    "productName": "Large Tote Bag",
+    "colourName": "Blue",
+    "unitPrice": 8500000,
+    "quantity": 2,
+    "status": "shipped",
+    "orderStatus": "paid",
+    "updatedAt": "2026-09-30T14:20:00Z"
+  },
+  "meta": {}
+}
+```
+
+`orderStatus` is the order's current status after the update, so the client can see whether this change completed the order.
+
+**Errors:**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | VALIDATION_ERROR | The item ID in the path is not a valid UUID, or the body is not valid JSON. |
+| 401 | UNAUTHENTICATED | User is not logged in or token is invalid. |
+| 403 | FORBIDDEN | Logged-in user is not a seller. |
+| 404 | NOT_FOUND | The order item does not exist, or belongs to another seller. |
+| 409 | INVALID_TRANSITION | The change is not allowed. The message names both statuses, e.g. "cannot change item from pending to shipped". |
+| 422 | VALIDATION_ERROR | `status` is missing, or is not "shipped" or "delivered". The message names the field. |
+
+**Idempotent?** Yes. The request sets a status, it does not add to anything. If a seller sends `shipped` for an item that is already `shipped`, the API returns `200 OK` with the current state and changes nothing. A double-click or retry therefore cannot ship an item twice or change the order twice. No `Idempotency-Key` header is needed.
+
 ## Schema Proof
