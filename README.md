@@ -135,6 +135,9 @@ status| enum| yes| Fixed order status values
 deliveryAddress| string| yes| Copy of the buyer's delivery address at order time, so it stays correct if the buyer changes their address later
 createdAt| timestamp| yes| 
 updatedAt| timestamp| yes| 
+| Field | Type | Required? | Notes |
+|---|---|---|---|
+| status | Enum | Yes | Fixed values: `paid`, `shipped`, `delivered` |
 
 8. Order Item
    Represents each product and selected colour included in an order.
@@ -195,7 +198,444 @@ The entities in the Fashion Marketplace are connected as follows:
 - User → Review: via Order Item. A buyer is connected to a review through Review → Order Item → Order → User.
 
 ## Hard Questions
+Order status
+![alt text](order-state-machine.png)
+
+Order statuses are:
+- "pending"
+- "paid"
+- "shipped"
+- "delivered"
+- "cancelled"
+
+Allowed transitions:
+- "pending → paid": payment succeeds.
+- "pending → cancelled": buyer cancels before payment.
+- "paid → shipped": all Order Items have been shipped.
+- "paid → cancelled": allowed with a refund if the order cannot be fulfilled before shipping.
+- "shipped → delivered": all Order Items have been delivered.
+
+Forbidden transitions:
+- "cancelled → anything": cancelled is a final state.
+- "paid → delivered": an order cannot skip the shipped state.
+- "pending → shipped": payment must be completed before shipping.
+- "paid → pending": an order cannot go back to pending after payment.
+- "paid → cancelled": forbidden once any Order Item has shipped, because that item cannot be un-shipped.
+- "shipped → cancelled": cancellation is no longer allowed after shipping.
+- "delivered → pending": delivered is a final completed state.
+- "delivered → cancelled": a delivered order cannot be cancelled.
+
+Each Order Item has its own status because one order can contain products from different sellers. The overall Order becomes "shipped" only when all its Order Items are "shipped", and becomes "delivered" only when all its Order Items are "delivered".
+
+The order stays "paid" until every Order Item is "shipped", even if some items have already been shipped.
+
+Only the seller associated with an Order Item can mark that item as "shipped" or "delivered".
+
+The API updates the Order Item status and the overall Order status in the same database transaction.
+
+Cancelling an order returns each item's quantity to its Product Colour's stock, in the same transaction.
+
+The API checks the current status before allowing a transition, and the database enum prevents invalid status values.
+
+State machine diagram:
+
+"Order State Machine" (docs/order-state-machine.png)
+
+Time
+
+Soft-deleted with "deletedAt":
+- User: soft-delete, because orders reference the buyer and deletion requests must still be honoured.
+- Seller: soft-delete, so seller records connected to products and order history remain available.
+- Product: soft-delete, because old orders may reference the product.
+- Product Colour: soft-delete with "deletedAt". "ON DELETE RESTRICT" also prevents hard deletion when the colour is referenced by an Order Item. A seller can also set its stock to "0" when they no longer want it available.
+
+The User, Seller, Product, and Product Colour tables must include a "deletedAt" field:
+
+- "deletedAt": nullable datetime. It is "NULL" when the record is active and set when the record is soft-deleted.
+
+For Product Colour, the "productId + colour" combination must only be unique where "deletedAt" is "NULL", so a seller can re-add a colour after the previous colour was soft-deleted.
+
+Temporary data that can be hard-deleted:
+- Cart
+- Cart Item
+
+Transaction and history records are retained:
+- Order
+- Order Item
+- Payment
+- Review
+
+These records represent completed or attempted transactions and should not be removed as normal product cleanup.
+
+Order Item.sellerId
+
+"OrderItem.sellerId" is copied from the product so a seller can list their own order items fast, even if the product is later removed.s
+
+
+Constraints and Indexes
+
+Constraints
+
+The following database constraints will be enforced:
+
+Entity| Constraint| Purpose
+User| "email" unique| Prevents multiple accounts from using the same email
+User| "role" enum: "buyer", "seller"| Prevents invalid user roles
+Seller| "userId" unique| Enforces one seller profile per user
+Product| "price > 0"| Prevents products from having a zero or negative price
+Product| "category" enum: "bags", "shoes", "clothes", "accessories"| Prevents inconsistent category values
+Product| "targetAudience" enum: "men", "women", "unisex"| Prevents inconsistent audience values
+Product Colour| "productId + colour" unique| Prevents the same colour from being added twice to one product
+Product Colour| "stockQuantity >= 0"| Prevents negative stock
+Cart| "userId" unique| Enforces one active cart per buyer
+Cart Item| "cartId + productColourId" unique| Prevents the same colour from appearing twice in one cart
+Cart Item| "quantity > 0"| Prevents zero or negative quantities
+Order| "total > 0"| Prevents an order from having a zero or negative total
+Order| "status" enum: "pending", "paid", "shipped", "delivered", "cancelled"| Prevents invalid order statuses
+Order Item| "quantity > 0"| Prevents zero or negative quantities
+Order Item| "unitPrice >= 0"| Prevents negative prices
+Order Item| "productColourId" ON DELETE RESTRICT| Prevents a colour that appears in an order from being hard-deleted
+Order Item| "status" enum: "pending", "paid", "shipped", "delivered", "cancelled"| Prevents invalid order item statuses
+Payment| "amount > 0"| Prevents a zero or negative payment amount
+Payment| "status" enum: "pending", "succeeded", "failed"| Prevents invalid payment statuses
+Payment| "paymentReference" unique| Prevents duplicate payment references
+Review| "orderItemId" unique| Allows only one review per purchased order item
+Review| "rating" between 1 and 5| Prevents invalid ratings
+
+The API must also check that an Order Item has status "delivered" before allowing a review to be created.
+
+Indexes
+
+Indexes will be added where they support common queries and are not already created automatically by unique constraints:
+
+Table| Index| Purpose
+Product| "sellerId"| Quickly find products belonging to a seller
+Product| "(category, targetAudience)"| Supports filtering products by category and target audience
+Cart Item| "productColourId"| Quickly find carts containing a specific product colour
+Order| "buyerId"| Quickly find orders belonging to a buyer
+Order Item| "orderId"| Quickly find items belonging to an order
+Order Item| "sellerId"| Quickly find a seller's order items
+Order Item| "productColourId"| Quickly find order items for a product colour
+Payment| "orderId"| Quickly find payment attempts for an order
+
+Unique constraints already create indexes, so separate indexes are not needed for "Seller.userId", "ProductColour(productId, colour)", "CartItem(cartId, productColourId)", "Payment.paymentReference", or "Review.orderItemId".
+
+Safe Stock Updates
+
+Stock is reduced using one atomic database update that only succeeds when enough stock is available:
+
+"stockQuantity >= quantity"
+
+If two buyers try to purchase the last item at the same time, only the first valid update succeeds. The second update changes nothing, and that buyer receives an out of stock error.
+
+Impossible States
+
+The database constraints and API rules prevent important invalid states:
+
+- A buyer cannot have two carts: "Cart.userId" is unique.
+- A colour cannot have negative stock, even if two buyers order the last item at once: "stockQuantity >= 0", and stock is reduced using an atomic update that requires enough stock.
+- A review cannot exist twice for one purchase: "Review.orderItemId" is unique.
+- A product colour used in an order cannot be hard-deleted: "OrderItem.productColourId" uses "ON DELETE RESTRICT".
+
+Hard Questions
+
+Normalisation
+
+Some information is deliberately copied instead of being read from the current Product record. "Order Item" stores the product name, colour name, unit price, and seller ID at purchase time, while "Order" stores a copy of the delivery address and total at order time. Without these copies, later product, seller, price, or address changes could make an old order show information that was not true when the purchase was made.
+
+"OrderItem.sellerId" is copied so a seller can list their own order items quickly, even if the product is later removed.
+
+Money
+All money values are stored as whole numbers in minor units, using kobo for NGN, with a separate currency column. This applies to "Product.price", "Order.total", "OrderItem.unitPrice", and "Payment.amount".
+
+Time
+"User" uses soft deletion through "deletedAt" because orders reference the buyer and deletion requests must still be honoured.
+
+"Seller" uses soft deletion through "deletedAt" so seller records connected to products and order history can remain available without removing historical relationships.
+
+"Product" uses soft deletion through "deletedAt" because old orders may still reference the product.
+
+"Product Colour" uses soft deletion through "deletedAt". It also has "ON DELETE RESTRICT" through Order Item, so a colour that has been ordered cannot be hard-deleted. A seller can instead mark it unavailable or set its stock to 0.
+
+Cart, Cart Item, Order, Order Item, Payment, and Review are hard-deleted only where appropriate because they represent temporary cart data or records whose relationships do not require historical preservation in the same way as products and transaction references.
+
+Identifiers
+All entity IDs are UUIDs rather than sequential numbers. UUIDs make IDs harder to guess, which reduces the risk of someone discovering other resources by simply changing an ID in a URL or API request.
+
 
 ## API Contracts
+
+**API Conventions**
+
+- All API paths start with "/api/v1".
+- Successful responses use:
+
+{
+  "data": {},
+  "meta": {}
+}
+
+- Error responses use:
+
+{
+  "error": {
+    "code": "...",
+    "message": "..."
+  }
+}
+
+- List endpoints use "limit", "offset", filters, and sort.
+- "limit" defaults to "20" and has a maximum of "100".
+- If "limit" is greater than "100", the API clamps it to "100".
+- All money values are sent and stored in kobo.
+- Protected endpoints require authentication.
+
+Idempotency
+
+Product creation uses an idempotency key to prevent duplicate products.
+
+The API stores:
+
+Field| Type| Purpose
+sellerId| UUID| Seller who made the request
+key| string| Idempotency key
+requestHash| string| Hash of the request body
+storedStatus| integer| Original response status
+storedResponse| JSON| Original response body
+createdAt| timestamp| When the record was created
+
+There is a unique constraint on "sellerId + key".
+
+The idempotency record and product are created in one database transaction.
+
+If two identical requests arrive at the same time, the unique "sellerId + key" constraint prevents both requests from creating the same product. The second request returns "409 REQUEST_IN_PROGRESS", or waits for the first transaction to finish and then returns the stored response.
+
+A retry using the same key and the same request body returns the original response with the same status and body.
+
+The same key with a different request body returns "422 IDEMPOTENCY_KEY_REUSED".
+
+A missing "Idempotency-Key" header returns "400 IDEMPOTENCY_KEY_REQUIRED".
+
+Idempotency records are deleted after 24 hours.
+
+**POST /api/v1/products**
+Who can call it: Authenticated sellers only.
+
+Headers:
+
+Header| Required?| Description
+"Authorization"| Yes| Login token used to identify the seller
+"Idempotency-Key"| Yes| Unique key for this product creation attempt
+
+Request body:
+
+Field| Type| Required?
+name| string| Yes
+imageUrl| string| Yes
+category| enum: "bags", "shoes", "clothes", "accessories"| Yes
+targetAudience| enum: "men", "women", "unisex"| Yes
+price| integer (kobo)| Yes
+currency| "NGN"| Yes
+sizeOrDimensions| string| Yes
+description| string| Yes
+material| string| No
+colours| array of objects| Yes
+
+Each colour contains:
+
+Field| Type| Required?
+colour| string| Yes
+stockQuantity| integer| Yes
+
+A product must have at least one colour. Colour names must be unique within the product.
+
+"sellerId" is taken from the authenticated user's login token and is not accepted in the request body.
+
+Errors:
+
+Status| Code| When
+400| "IDEMPOTENCY_KEY_REQUIRED"| "Idempotency-Key" header is missing.
+400| "MALFORMED_JSON"| Request body is not valid JSON.
+401| "UNAUTHENTICATED"| User is not logged in or token is invalid.
+403| "FORBIDDEN"| Logged-in user is not a seller.
+409| "REQUEST_IN_PROGRESS"| Another request with the same seller and idempotency key is currently being processed.
+422| "VALIDATION_ERROR"| A required field is missing or has an invalid value.
+422| "IDEMPOTENCY_KEY_REUSED"| Same key was used with a different request body.
+
+Examples of "VALIDATION_ERROR" messages:
+
+"name is required"
+"category is invalid"
+"targetAudience is invalid"
+"currency must be NGN"
+"price must be greater than 0"
+"colours must contain at least one colour"
+"colour names must be unique"
+"stockQuantity must be a whole number, 0 or more"
+
+Success response: "201 Created"
+
+The response includes "sellerId", "createdAt", "updatedAt", and calculated "totalStock".
+
+"totalStock" is not stored in the database. It is calculated by adding the stock quantity of all product colours.
+
+Idempotent? Yes.
+
+The API stores the idempotency key, request hash, and original response. A retry with the same key and body returns the original response instead of creating another product.
+
+
+**GET /api/v1/products**
+Who can call it: Public. Buyers do not need to be logged in.
+
+Query parameters:
+Parameter| Type| Default| Allowed values
+"limit"| integer| "20"| Whole number from "1–100". Values above "100" are clamped to "100".
+"offset"| integer| "0"| Whole number "0" or greater
+"category"| string| None| "bags", "shoes", "clothes", "accessories"
+"targetAudience"| string| None| "men", "women", "unisex"
+"minPrice"| integer| None| Whole number "0" or greater, in kobo
+"maxPrice"| integer| None| Whole number "0" or greater, in kobo
+"sort"| string| "createdAt"| "price", "createdAt"
+"order"| string| "desc"| "asc", "desc"
+
+If "limit" is greater than "100", the API clamps it to "100".
+
+If "offset" is beyond the total number of matching products, the API returns "200 OK" with an empty "data" array and "hasMore: false". This is not treated as an error.
+
+Results are always ordered by the chosen sort field, then by "id". This provides a stable tie-break when multiple products have the same price or creation time.
+
+The endpoint returns active products only. Soft-deleted products are excluded.
+
+A product remains listed even when all its colours are out of stock. It is shown as out of stock so buyers can still see the product.
+
+The browse response contains summary information rather than the full product description. The full description is returned by "GET /api/v1/products/:id".
+
+Success response: "200 OK"
+
+{
+  "data": [
+    {
+      "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
+      "name": "Large Tote Bag",
+      "imageUrl": "https://example.com/tote-bag.jpg",
+      "category": "bags",
+      "targetAudience": "women",
+      "price": 8500000,
+      "currency": "NGN",
+      "sizeOrDimensions": "Large",
+      "colours": [
+        {
+          "colour": "Black",
+          "inStock": false
+        },
+        {
+          "colour": "Blue",
+          "inStock": true
+        },
+        {
+          "colour": "Green",
+          "inStock": true
+        }
+      ],
+      "totalStock": 8
+    }
+  ],
+  "meta": {
+    "total": 1,
+    "limit": 20,
+    "offset": 0,
+    "hasMore": false
+  }
+}
+
+Errors:
+
+Status| Code| When
+400| "VALIDATION_ERROR"| A query parameter is missing a valid value or has an invalid value.
+
+Examples:
+
+"limit must be a whole number between 1 and 100"
+"offset must be a whole number 0 or greater"
+"category is invalid"
+"targetAudience is invalid"
+"minPrice must be a whole number 0 or greater"
+"maxPrice must be a whole number 0 or greater"
+"minPrice cannot be greater than maxPrice"
+"sort must be price or createdAt"
+"order must be asc or desc"
+
+A "limit" above "100" is not an error. It is clamped to "100".
+
+Safe and idempotent? Yes.
+
+GET does not modify product data or application state. Repeating the same request is safe and idempotent for the same underlying data.
+
+**GET /api/v1/products/:id**
+Who can call it: Public. Buyers do not need to be logged in.
+
+Path parameter:
+Parameter| Type| Required?
+"id"| UUID| Yes
+
+Success response: "200 OK"
+
+{
+  "data": {
+    "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
+    "sellerId": "7a2b3c4d-5e6f-7a8b-9c10-11d12e13f14a",
+    "name": "Large Tote Bag",
+    "imageUrl": "https://example.com/tote-bag.jpg",
+    "category": "bags",
+    "targetAudience": "women",
+    "price": 8500000,
+    "currency": "NGN",
+    "sizeOrDimensions": "Large",
+    "description": "Large everyday tote bag.",
+    "material": "Leather",
+    "colours": [
+      {
+        "id": "1b2c3d4e-5f6a-7b8c-9d10-11e12f13a14b",
+        "colour": "Black",
+        "inStock": false
+      },
+      {
+        "id": "2b3c4d5e-6f7a-8b9c-0d11-12e13f14a15b",
+        "colour": "Blue",
+        "inStock": true
+      },
+      {
+        "id": "3b4c5d6e-7f8a-9b0c-1d12-13e14f15a16b",
+        "colour": "Green",
+        "inStock": true
+      }
+    ],
+    "totalStock": 8,
+    "createdAt": "2026-09-29T10:00:00Z",
+    "updatedAt": "2026-09-29T10:00:00Z"
+  },
+  "meta": {}
+}
+
+The public product detail page shows only "inStock", not the exact "stockQuantity" for each colour. This prevents exposing the seller's exact inventory while still telling buyers whether a colour is available.
+
+"totalStock" is shown because the requirements require buyers to see overall stock availability; the exact stock per colour is still hidden.
+
+Errors:
+
+Status| Code| When
+400| "VALIDATION_ERROR"| The product ID is not a valid UUID.
+404| "NOT_FOUND"| The product does not exist or has been soft-deleted.
+
+Soft-deleted products return "404 NOT_FOUND" through the public API.
+
+Safe and idempotent? Yes.
+
+GET does not modify product data or application state.
+
+Product Availability Decisions
+1. Product with all colours out of stock: The product remains listed. Buyers can still view it, but it is shown as out of stock and no colour can be selected for purchase.
+
+2. Exact stock visibility: The public detail page shows only "inStock", not the exact "stockQuantity" for each colour. "totalStock" is still shown because the requirements require overall stock availability.
 
 ## Schema Proof
