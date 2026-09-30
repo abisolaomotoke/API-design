@@ -873,4 +873,104 @@ If any step fails, nothing is saved.
 
 **Idempotent?** Yes. The request sets a status, it does not add to anything. If a seller sends `shipped` for an item that is already `shipped`, the API returns `200 OK` with the current state and changes nothing. A double-click or retry therefore cannot ship an item twice or change the order twice. No `Idempotency-Key` header is needed.
 
+### Over-fetching
+
+**Endpoint chosen:** `GET /api/v1/products` (the browse list).
+
+**The problem:** a product card on the browse page only needs the product's name, image and price. But each REST result also carries category, target audience, size, the full colours list and `totalStock`. A buyer scrolling through 20 products downloads all of that for every card, even though the card never shows most of it.
+
+**REST response (one item from the list):**
+
+```json
+{
+  "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
+  "name": "Large Tote Bag",
+  "imageUrl": "https://example.com/tote-bag.jpg",
+  "category": "bags",
+  "targetAudience": "women",
+  "price": 8500000,
+  "currency": "NGN",
+  "sizeOrDimensions": "Large",
+  "colours": [
+    { "colour": "Black", "inStock": false },
+    { "colour": "Blue", "inStock": true },
+    { "colour": "Green", "inStock": true }
+  ],
+  "totalStock": 8
+}
+```
+
+**GraphQL query for the same need:** the client asks only for the three fields the card shows.
+
+```graphql
+query {
+  products(limit: 20) {
+    id
+    name
+    imageUrl
+    price
+  }
+}
+```
+
+**What GraphQL would return:**
+
+```json
+{
+  "data": {
+    "products": [
+      {
+        "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
+        "name": "Large Tote Bag",
+        "imageUrl": "https://example.com/tote-bag.jpg",
+        "price": 8500000
+      }
+    ]
+  }
+}
+```
+
+**When REST is still fine:**
+- The extra fields are small. Each product adds only a few hundred bytes, so the saving is real but not large.
+- REST can already shrink the response without GraphQL, for example with a `?fields=name,imageUrl,price` query parameter.
+- REST is simpler to build, cache, document and test. This follows the class guidance that REST is the right choice for an MVP. GraphQL adds a schema, a resolver layer and harder caching, and a small team building a first version should not pay that cost early.
+
+**Decision:** use REST for the MVP. Switch to GraphQL when one of these happens:
+1. Several clients (web, mobile app, seller dashboard) need very different shapes of the same data, and adding a special endpoint or `fields` option for each becomes hard to maintain.
+2. One screen needs three or more separate requests to load, for example the product, its seller and its reviews, and the extra round trips make the page noticeably slow.
+
+The trigger is how many different clients and screens need different data shapes, not the number of users.
+
+### Real-time
+
+**Place chosen:** a buyer watches their order move from `paid` to `shipped` to `delivered` without refreshing the page or repeatedly asking the server.
+
+**Tool chosen:** Server-Sent Events (SSE).
+
+**Why SSE and not WebSockets:**
+- SSE is one-directional: the server sends updates to the client. WebSockets are bidirectional: both sides can send messages at any time.
+- Here the buyer only listens. They send nothing back while watching the order, so two-way communication is not needed.
+- SSE runs over normal HTTP and the browser reconnects automatically if the connection drops. That makes it simpler to build and to run than WebSockets.
+
+**Endpoint:** `GET /api/v1/orders/:id/events`
+- Who can call it: the authenticated buyer who owns the order. Any other user gets `404 NOT_FOUND`.
+- Response: `200 OK` with `Content-Type: text/event-stream`. The connection stays open and the server sends an event each time the order changes.
+- Note: the browser's built-in `EventSource` cannot send an `Authorization` header, so this endpoint accepts the login token through a secure cookie (or a short-lived token). The client must not put the normal login token in the URL.
+
+**Example event:** sent when a seller marks an item as shipped.
+
+```
+event: order.item.shipped
+data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","itemId":"d5e6f7a8-b9c0-4d1e-a2f3-a4b5c6d7e8f9","itemStatus":"shipped","orderStatus":"paid"}
+```
+
+A second event is sent when the last item ships and the order itself changes:
+
+```
+event: order.status.changed
+data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","orderStatus":"shipped"}
+```
+
+**When I would switch to WebSockets:** if the product later needs two-way messaging, for example a live chat between buyer and seller, because then the client also needs to send messages to the server over the same connection.
+
 ## Schema Proof
