@@ -973,4 +973,5 @@ data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","orderStatus":"shipped"}
 
 **When I would switch to WebSockets:** if the product later needs two-way messaging, for example a live chat between buyer and seller, because then the client also needs to send messages to the server over the same connection.
 
+
 ## Schema Proof
