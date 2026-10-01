@@ -1040,3 +1040,303 @@ Screenshot of the three errors:
 - A colour used in an order cannot be hard-deleted (`ON DELETE RESTRICT`).
 - A seller cannot have two seller profiles (`sellers_user_id_unique`).
 - A product cannot have the same active colour twice (the partial unique index `product_colours_product_colour_unique`).
+
+### POST /api/v1/orders/:id/payments
+
+A buyer pays for a `pending` order. This starts one payment attempt (part of Action 4).
+
+**Who can call it:** the authenticated buyer who owns the order. Any other user gets `404 NOT_FOUND`.
+
+**Headers**
+
+| Header | Required? | Description |
+|---|---|---|
+| Authorization | Yes | Login token used to identify the buyer |
+| Idempotency-Key | Yes | Unique key for this payment attempt. A double-click must never start two payments |
+
+**Path parameter**
+
+| Parameter | Type | Required? |
+|---|---|---|
+| id | UUID | Yes (the order ID) |
+
+**Request body:** none. The amount and currency always come from the order, never from the client, so a buyer cannot change what they pay.
+
+**What the API does, in this order**
+
+1. Lock the order row and check the buyer owns it. If not, stop with `NOT_FOUND`.
+2. Check the order status is `pending`. If not, stop with `ORDER_NOT_PAYABLE`.
+3. Check the order has no payment attempt that is still `pending`. If it has, stop with `PAYMENT_IN_PROGRESS`.
+4. Create a Payment with status `pending`, the order's total as `amount`, and a new unique `paymentReference`.
+5. Call the payment provider to create a checkout session (this call may fail and may be slow). If it fails, set the Payment to `failed` and return `PAYMENT_PROVIDER_ERROR`. The order stays `pending`, so the buyer can try again.
+6. Return the checkout link. The buyer finishes paying on the provider's page.
+
+The order does not become `paid` here. Only the provider's confirmation (the webhook below) can do that.
+
+**Success response:** `201 Created`
+
+```json
+{
+  "data": {
+    "id": "e6f7a8b9-c0d1-4e2f-b3a4-b5c6d7e8f9a0",
+    "orderId": "c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8",
+    "amount": 17000000,
+    "currency": "NGN",
+    "status": "pending",
+    "paymentReference": "PAY-8F3K29XQ",
+    "checkoutUrl": "https://checkout.provider.example/PAY-8F3K29XQ"
+  },
+  "meta": {}
+}
+```
+
+**Errors**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `IDEMPOTENCY_KEY_REQUIRED` | The `Idempotency-Key` header is missing. |
+| 400 | `VALIDATION_ERROR` | The order ID is not a valid UUID. |
+| 401 | `UNAUTHENTICATED` | The user is not logged in or the token is invalid. |
+| 403 | `FORBIDDEN` | The logged-in user is not a buyer. |
+| 404 | `NOT_FOUND` | The order does not exist or belongs to another buyer. |
+| 409 | `ORDER_NOT_PAYABLE` | The order is not `pending` (already paid, cancelled, shipped or delivered). |
+| 409 | `PAYMENT_IN_PROGRESS` | The order already has a payment attempt that is still `pending`. |
+| 409 | `REQUEST_IN_PROGRESS` | Another request with the same buyer and key is still being processed. |
+| 422 | `IDEMPOTENCY_KEY_REUSED` | The same key was used with a different request. |
+| 502 | `PAYMENT_PROVIDER_ERROR` | The payment provider could not create the checkout session. |
+
+**Idempotent?** Yes, using the `Idempotency-Key` header, with the same rules as product creation. A retry returns the original response and does not start a second payment.
+
+---
+
+### POST /api/v1/payments/webhook
+
+The payment provider calls this endpoint to tell the marketplace whether a payment succeeded or failed. Users never call it.
+
+**Who can call it:** only the payment provider. Every request must carry a signature header (`X-Signature`) that the API checks against a secret shared with the provider. A request with a missing or wrong signature is rejected.
+
+**Request body**
+
+| Field | Type | Required? |
+|---|---|---|
+| paymentReference | string | Yes |
+| status | enum: `succeeded`, `failed` | Yes |
+| amount | integer (kobo) | Yes |
+
+**What the API does, in this order, inside ONE database transaction**
+
+1. Check the signature. If it is wrong, stop with `INVALID_SIGNATURE`.
+2. Find the Payment by `paymentReference`. If it does not exist, stop with `NOT_FOUND`.
+3. If the Payment is already `succeeded` or `failed`, change nothing and return `200 OK`. Providers send the same event more than once, so repeats must be safe.
+4. Check `amount` equals the Payment's amount. If not, stop with `AMOUNT_MISMATCH` and change nothing.
+5. If `status` is `failed`: set the Payment to `failed`. The order stays `pending` and the buyer can try again.
+6. If `status` is `succeeded`: lock the order, set the Payment to `succeeded`, and then:
+   - if the order is `pending`, set the order to `paid` and all its Order Items to `paid`;
+   - if the order was already cancelled (for example, auto-cancelled after 30 minutes while the buyer was paying), keep the Payment as `succeeded` and flag it for a refund. The refund itself is outside this design.
+
+**Success response:** `200 OK`
+
+```json
+{
+  "data": { "received": true },
+  "meta": {}
+}
+```
+
+**Errors**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `MALFORMED_JSON` | The body is not valid JSON. |
+| 401 | `INVALID_SIGNATURE` | The signature is missing or wrong. |
+| 404 | `NOT_FOUND` | No payment has this reference. |
+| 422 | `VALIDATION_ERROR` | A required field is missing or invalid. The message names the field. |
+| 422 | `AMOUNT_MISMATCH` | The amount does not match the payment. |
+
+**Idempotent?** Yes. A payment that is already `succeeded` or `failed` is never changed again, so the same event sent twice has the same result as sending it once.
+
+---
+
+### POST /api/v1/orders/:id/cancel
+
+A buyer cancels an order. This is a POST and not a DELETE because an order is never deleted. It stays as history with status `cancelled`.
+
+**Who can call it:** the authenticated buyer who owns the order. Any other user gets `404 NOT_FOUND`.
+
+**Headers**
+
+| Header | Required? | Description |
+|---|---|---|
+| Authorization | Yes | Login token used to identify the buyer |
+
+**Request body:** none.
+
+**What the API does, in this order, inside ONE database transaction**
+
+1. Lock the order row and check the buyer owns it. If not, stop with `NOT_FOUND`.
+2. If the order is already `cancelled`, change nothing and return it.
+3. If the order is `pending`: set it to `cancelled`.
+4. If the order is `paid` and no Order Item has shipped: set it to `cancelled`.
+5. Otherwise (the order is `paid` and any item has shipped, or the order is `shipped` or `delivered`), stop with `ORDER_NOT_CANCELLABLE`.
+6. Set all its Order Items to `cancelled`.
+7. Return each item's quantity to its Product Colour's stock.
+8. If the order was `paid`, request a refund for its succeeded payment. The refund itself is handled by the payment provider and is outside this design.
+
+If any step fails, nothing is saved.
+
+**Success response:** `200 OK`
+
+```json
+{
+  "data": {
+    "id": "c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8",
+    "status": "cancelled",
+    "refundRequested": true,
+    "updatedAt": "2026-09-30T15:00:00Z"
+  },
+  "meta": {}
+}
+```
+
+**Errors**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | The order ID is not a valid UUID. |
+| 401 | `UNAUTHENTICATED` | The user is not logged in or the token is invalid. |
+| 403 | `FORBIDDEN` | The logged-in user is not a buyer. |
+| 404 | `NOT_FOUND` | The order does not exist or belongs to another buyer. |
+| 409 | `ORDER_NOT_CANCELLABLE` | An item has already shipped, or the order is `shipped` or `delivered`. The message names the current status. |
+
+**Idempotent?** Yes. Cancelling an order that is already `cancelled` returns `200 OK` with the current state and changes nothing, so stock is never returned twice.
+
+---
+
+### POST /api/v1/order-items/:id/reviews
+
+A buyer reviews an item they bought, after it has been delivered.
+
+**Who can call it:** the authenticated buyer who owns the order that contains the item. Any other user gets `404 NOT_FOUND`.
+
+**Headers**
+
+| Header | Required? | Description |
+|---|---|---|
+| Authorization | Yes | Login token used to identify the buyer |
+
+**Request body**
+
+| Field | Type | Required? |
+|---|---|---|
+| rating | integer | Yes (1 to 5) |
+| comment | string | No |
+
+**What the API does, in this order**
+
+1. Find the Order Item and check the buyer owns its order. If not, stop with `NOT_FOUND`.
+2. Check the item's status is `delivered`. If not, stop with `ITEM_NOT_DELIVERED`.
+3. Save the review. The unique `orderItemId` rule stops a second review for the same purchase, and the API returns `REVIEW_ALREADY_EXISTS`.
+
+A review belongs to the purchase (the Order Item), not directly to the product. This is why a review cannot exist without a delivered order.
+
+**Success response:** `201 Created`
+
+```json
+{
+  "data": {
+    "id": "f7a8b9c0-d1e2-4f3a-84b5-c6d7e8f9a0b1",
+    "orderItemId": "d5e6f7a8-b9c0-4d1e-a2f3-a4b5c6d7e8f9",
+    "rating": 5,
+    "comment": "Lovely bag, arrived on time.",
+    "createdAt": "2026-10-02T09:30:00Z"
+  },
+  "meta": {}
+}
+```
+
+**Errors**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `MALFORMED_JSON` | The body is not valid JSON. |
+| 401 | `UNAUTHENTICATED` | The user is not logged in or the token is invalid. |
+| 403 | `FORBIDDEN` | The logged-in user is not a buyer. |
+| 404 | `NOT_FOUND` | The order item does not exist or is not in this buyer's order. |
+| 409 | `ITEM_NOT_DELIVERED` | The item's status is not `delivered`. |
+| 409 | `REVIEW_ALREADY_EXISTS` | This item already has a review. |
+| 422 | `VALIDATION_ERROR` | `rating` is missing or not a whole number from 1 to 5. The message names the field. |
+
+**Idempotent?** No key is needed. Sending the same request twice is safe, because the unique `orderItemId` rule makes the second one fail with `REVIEW_ALREADY_EXISTS`, so only one review is ever saved.
+
+---
+
+### POST /api/v1/product-colours/:id/restock
+
+A seller adds stock to one of their colours.
+
+**Who can call it:** the authenticated seller who owns the product. Any other user gets `404 NOT_FOUND`.
+
+**Headers**
+
+| Header | Required? | Description |
+|---|---|---|
+| Authorization | Yes | Login token used to identify the seller |
+| Idempotency-Key | Yes | Unique key for this restock. A double-click must not add the stock twice |
+
+**Request body**
+
+| Field | Type | Required? |
+|---|---|---|
+| quantity | integer | Yes (whole number, 1 or more) |
+
+**Why this adds stock instead of setting a new number:** if a seller sets the stock to 10 at the same moment a buyer's order takes one item, a "set" would overwrite the order's change and stock would be wrong. An "add" is applied to the current number inside the database (`stockQuantity = stockQuantity + quantity`), so both changes are kept.
+
+**Success response:** `200 OK`. The seller sees the exact stock, which buyers never see.
+
+```json
+{
+  "data": {
+    "id": "2b3c4d5e-6f7a-8b9c-0d11-12e13f14a15b",
+    "productId": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
+    "colour": "Blue",
+    "stockQuantity": 15,
+    "updatedAt": "2026-09-30T16:00:00Z"
+  },
+  "meta": {}
+}
+```
+
+**Errors**
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `IDEMPOTENCY_KEY_REQUIRED` | The `Idempotency-Key` header is missing. |
+| 400 | `MALFORMED_JSON` | The body is not valid JSON. |
+| 401 | `UNAUTHENTICATED` | The user is not logged in or the token is invalid. |
+| 403 | `FORBIDDEN` | The logged-in user is not a seller. |
+| 404 | `NOT_FOUND` | The colour does not exist, was removed, or belongs to another seller's product. |
+| 409 | `REQUEST_IN_PROGRESS` | Another request with the same seller and key is still being processed. |
+| 422 | `VALIDATION_ERROR` | `quantity` is missing or not a whole number of 1 or more. The message names the field. |
+| 422 | `IDEMPOTENCY_KEY_REUSED` | The same key was used with a different request. |
+
+**Idempotent?** Yes, using the `Idempotency-Key` header. A retry returns the original response and does not add the stock twice.
+
+---
+
+### Other endpoints
+
+These follow the same conventions as the contracts above: the `data` and `meta` envelope, the same error shape, `404` (not `403`) when a record belongs to someone else, and the same pagination rules. Every list returns `meta` with `total`, `limit`, `offset` and `hasMore`.
+
+| Endpoint | Who | What it does | Errors | Idempotent? |
+|---|---|---|---|---|
+| `PATCH /api/v1/products/:id` | Seller who owns the product | Updates any of: `name`, `imageUrl`, `category`, `targetAudience`, `price`, `sizeOrDimensions`, `description`, `material`. At least one field is required. `sellerId`, `currency` and stock cannot be changed here (stock changes use restock). A new price only affects future orders, because old Order Items keep their own copy. Returns the updated product | 400 `MALFORMED_JSON`, 401, 403, 404 (not found, removed, or not yours), 422 `VALIDATION_ERROR` | Yes, it sets values |
+| `DELETE /api/v1/products/:id` | Seller who owns the product | Soft-deletes the product by setting `deletedAt`. Old orders are not affected. Its colours stop being available, and an order that contains a removed product returns `409 OUT_OF_STOCK` naming the item. Returns `204 No Content` | 400 `VALIDATION_ERROR`, 401, 403, 404 | Yes in effect. A second call returns `404`, and the state is the same |
+| `DELETE /api/v1/product-colours/:id` | Seller who owns the product | Soft-deletes a colour by setting `deletedAt`. The colour can be added again later. Returns `204 No Content` | 400 `VALIDATION_ERROR`, 401, 403, 404 | Yes in effect, same as above |
+| `GET /api/v1/seller/products` | Seller | Lists the seller's own products with the exact `stockQuantity` of each colour. Filters: `category`, `targetAudience`. Sort: `price`, `createdAt` | 400 `VALIDATION_ERROR` (bad query), 401, 403 | Yes, safe |
+| `GET /api/v1/cart` | Buyer | Returns the buyer's cart with each item's name, colour, current price, quantity, line total, and an `available` flag. Also returns `cartTotal`. A buyer with no cart gets an empty `items` list | 401, 403 | Yes, safe |
+| `PATCH /api/v1/cart/items/:id` | Buyer who owns the cart | Sets the quantity of a cart item. Body: `quantity` (whole number, 1 or more). Checked against available stock. Returns the updated item | 400 `MALFORMED_JSON`, 401, 403, 404, 409 `OUT_OF_STOCK`, 409 `INSUFFICIENT_STOCK`, 422 `VALIDATION_ERROR` | Yes, it sets a value |
+| `DELETE /api/v1/cart/items/:id` | Buyer who owns the cart | Removes an item from the cart (cart items are hard-deleted). Returns `204 No Content` | 400 `VALIDATION_ERROR`, 401, 403, 404 | Yes in effect. A second call returns `404`, and the state is the same |
+| `GET /api/v1/orders` | Buyer | Lists the buyer's own orders. Filter: `status`. Sort: `createdAt` (default, newest first). Uses `limit` and `offset` | 400 `VALIDATION_ERROR` (bad query), 401, 403 | Yes, safe |
+| `GET /api/v1/orders/:id` | Buyer who owns the order | Returns one order with its items (including each item's status) and its payment attempts | 400 `VALIDATION_ERROR`, 401, 403, 404 | Yes, safe |
+| `GET /api/v1/seller/order-items` | Seller | Lists only the seller's own order items, using the `sellerId` copy on each item. Filter: `status`. Sort: `createdAt`. Shows the delivery address of paid orders only | 400 `VALIDATION_ERROR` (bad query), 401, 403 | Yes, safe |
+| `GET /api/v1/products/:id/reviews` | Public | Lists the reviews of a product, newest first. Each review shows `rating`, `comment`, `createdAt` and the buyer's first name only. `meta` also includes `averageRating` | 400 `VALIDATION_ERROR`, 404 (product not found or removed) | Yes, safe |
