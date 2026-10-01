@@ -1,5 +1,8 @@
 # Fashion Marketplace: API Design and Data Modeling
 
+## LinkedIn Post
+[Read the LinkedIn post] (https://lnkd.in/p/gewjhUe4)
+
 A design document and data model for a fashion marketplace, with a working Postgres schema that proves the model holds.
 
 ## Requirements
