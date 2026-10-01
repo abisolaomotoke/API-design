@@ -975,3 +975,92 @@ data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","orderStatus":"shipped"}
 
 
 ## Schema Proof
+## Schema Proof
+
+This section proves the data model works. I implemented only the schema, then ran queries against it and tried to break it.
+
+The database is Postgres, running in Docker. Table and column names use `snake_case` (for example `stock_quantity`), while the design sections above use `camelCase`.
+
+### Files
+
+| File | What it does |
+|---|---|
+| `db/migrations/001_init.sql` | Creates the enums, 11 tables, constraints and indexes |
+| `db/seed.sql` | Loads a small dataset: 2 sellers, 2 buyers, 4 products with colours, 1 cart, 2 orders and 1 review |
+| `db/queries.sql` | One query for each of the five important actions |
+| `db/explain.sql` | Query plans for the two heaviest queries |
+| `db/invalid_inserts.sql` | Three invalid states the database must reject |
+
+### How to run it
+
+Start Postgres and create the database:
+
+```
+docker run --name fashion-db -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:16
+docker exec -it fashion-db psql -U postgres -c "CREATE DATABASE fashion_marketplace;"
+```
+
+Run each file (PowerShell):
+
+```
+Get-Content db\migrations\001_init.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\seed.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\queries.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\explain.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\invalid_inserts.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+```
+
+`seed.sql` clears the tables first, so it can be run again at any time. To run `queries.sql` a second time, run `seed.sql` first.
+
+### The five queries
+
+Each query answers one of the five important actions.
+
+| Action | What the query does |
+|---|---|
+| 1. Seller lists a product | Inserts the product and its colours with stock in one transaction |
+| 2. Buyer browses products | Filters by category, audience and price, sorts by price, and paginates. Returns each colour's `inStock` and the total stock |
+| 3. Buyer adds a colour to the cart | Inserts the cart item, or adds to the quantity if it is already there. Only works if the colour exists and has stock |
+| 4. Buyer places an order | In one transaction: snapshots the cart, reduces stock only where enough is left, creates the order and order items with copied names and prices, and empties the cart |
+| 5. Seller ships an order item | In one transaction: locks the order, ships the seller's own item, and moves the order to `shipped` only if every item has shipped |
+
+Output of the five queries:
+
+![Output of the five queries](docs/screenshots/queries-output.png)
+
+### Query plans
+
+I checked the plans of the two heaviest queries: browsing products (Action 2) and the cart snapshot used when placing an order (Action 4).
+
+The test data has only a few rows, so Postgres would normally read the whole table instead of using an index. To show that my indexes can be used, `explain.sql` turns off sequential scans for the session with `SET enable_seqscan = off`. With real data volumes Postgres chooses the index on its own.
+
+**Browse products** uses the index `products_category_audience_idx`:
+
+![Query plan for browsing products](docs/screenshots/plan-browse.png)
+
+**Cart snapshot when placing an order** uses the index `cart_items_cart_colour_unique`:
+
+![Query plan for the cart snapshot](docs/screenshots/plan-cart-snapshot.png)
+
+### Invalid states the database rejects
+
+I tried three invalid actions. The database rejected each one.
+
+| # | Invalid state I tried | What stopped it | Real-world mistake it prevents |
+|---|---|---|---|
+| 1 | A second cart for the same buyer | Unique constraint `carts_user_id_unique` | A buyer with two carts, so items and totals get mixed up |
+| 2 | A product with a price of 0 | Check constraint `products_price_positive` | A seller listing a product for free by mistake |
+| 3 | Deleting a colour that appears in an order | Foreign key `order_items_product_colour_id_fkey` (`ON DELETE RESTRICT`) | Losing the record of what a buyer purchased |
+
+Screenshot of the three errors:
+
+![The three rejected invalid states](docs/screenshots/invalid-inserts.png)
+
+### What the schema makes impossible
+
+- A buyer cannot have two carts (`carts_user_id_unique`).
+- A colour cannot go below zero stock, even if two buyers order the last item at once (`product_colours_stock_not_negative`).
+- A purchased item cannot be reviewed twice (`reviews_order_item_unique`).
+- A colour used in an order cannot be hard-deleted (`ON DELETE RESTRICT`).
+- A seller cannot have two seller profiles (`sellers_user_id_unique`).
+- A product cannot have the same active colour twice (the partial unique index `product_colours_product_colour_unique`).
