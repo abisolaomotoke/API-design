@@ -414,7 +414,7 @@ If two buyers try to buy the last item at the same time, only the first valid up
 
 ### Idempotency
 
-Product creation and order placement use an idempotency key to prevent duplicate products or orders. The keys are stored in the Idempotency Key table (see Entities).
+Product creation, order placement, payments and restocking use an idempotency key to prevent duplicates.The keys are stored in the Idempotency Key table (see Entities).
 
 - The idempotency record and the product or order are created in one database transaction.
 - If two identical requests arrive at the same time, the unique `userId + key` constraint prevents both from creating the same product or order. The second request returns `409 REQUEST_IN_PROGRESS`, or waits for the first transaction to finish and then returns the stored response.
@@ -752,7 +752,7 @@ If any step fails, nothing is saved: no order, no stock change, and the cart sta
 | 401 | `UNAUTHENTICATED` | The user is not logged in or the token is invalid. |
 | 403 | `FORBIDDEN` | The logged-in user is not a buyer. |
 | 409 | `CART_EMPTY` | The buyer's cart has no items. |
-| 409 | `OUT_OF_STOCK` | At least one colour does not have enough stock. The message names the product and colour, for example "Large Tote Bag (Blue) does not have enough stock". |
+| 409 | `OUT_OF_STOCK` | At least one colour does not have enough stock. The message names the product and colour, for example "Large Tote Bag (Blue) does not have enough stock". Also returned when the product or colour has been removed.|
 | 409 | `REQUEST_IN_PROGRESS` | Another request with the same buyer and idempotency key is still being processed. |
 | 422 | `VALIDATION_ERROR` | `deliveryAddress` is missing or empty. The message names the field. |
 | 422 | `IDEMPOTENCY_KEY_REUSED` | The same key was used with a different request body. |
@@ -846,200 +846,6 @@ If any step fails, nothing is saved.
 | 422 | `VALIDATION_ERROR` | `status` is missing, or is not `shipped` or `delivered`. The message names the field. |
 
 **Idempotent?** Yes. The request sets a status, it does not add to anything. If a seller sends `shipped` for an item that is already `shipped`, the API returns `200 OK` with the current state and changes nothing. A double-click or retry cannot ship an item twice or change the order twice. No `Idempotency-Key` header is needed.
-
-### Over-fetching
-
-**Endpoint chosen:** `GET /api/v1/products` (the browse list).
-
-**The problem:** a product card on the browse page only needs the product's name, image and price. But each REST result also carries category, target audience, size, the full colours list and `totalStock`. A buyer scrolling through 20 products downloads all of that for every card, even though the card never shows most of it.
-
-**REST response (one item from the list)**
-
-```json
-{
-  "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
-  "name": "Large Tote Bag",
-  "imageUrl": "https://example.com/tote-bag.jpg",
-  "category": "bags",
-  "targetAudience": "women",
-  "price": 8500000,
-  "currency": "NGN",
-  "sizeOrDimensions": "Large",
-  "colours": [
-    { "colour": "Black", "inStock": false },
-    { "colour": "Blue", "inStock": true },
-    { "colour": "Green", "inStock": true }
-  ],
-  "totalStock": 8
-}
-```
-
-**GraphQL query for the same need:** the client asks only for the three fields the card shows.
-
-```graphql
-query {
-  products(limit: 20) {
-    id
-    name
-    imageUrl
-    price
-  }
-}
-```
-
-**What GraphQL would return**
-
-```json
-{
-  "data": {
-    "products": [
-      {
-        "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
-        "name": "Large Tote Bag",
-        "imageUrl": "https://example.com/tote-bag.jpg",
-        "price": 8500000
-      }
-    ]
-  }
-}
-```
-
-**When REST is still fine**
-
-- The extra fields are small. Each product adds only a few hundred bytes, so the saving is real but not large.
-- REST can already shrink the response without GraphQL, for example with a `?fields=name,imageUrl,price` query parameter.
-- REST is simpler to build, cache, document and test. This follows the class guidance that REST is the right choice for an MVP. GraphQL adds a schema, a resolver layer and harder caching, and a small team building a first version should not pay that cost early.
-
-**Decision:** use REST for the MVP. Switch to GraphQL when one of these happens:
-
-1. Several clients (web, mobile app, seller dashboard) need very different shapes of the same data, and adding a special endpoint or `fields` option for each becomes hard to maintain.
-2. One screen needs three or more separate requests to load, for example the product, its seller and its reviews, and the extra round trips make the page noticeably slow.
-
-The trigger is how many different clients and screens need different data shapes, not the number of users.
-
-### Real-time
-
-**Place chosen:** a buyer watches their order move from `paid` to `shipped` to `delivered` without refreshing the page or repeatedly asking the server.
-
-**Tool chosen:** Server-Sent Events (SSE).
-
-**Why SSE and not WebSockets**
-
-- SSE is one-directional: the server sends updates to the client. WebSockets are bidirectional: both sides can send messages at any time.
-- Here the buyer only listens. They send nothing back while watching the order, so two-way communication is not needed.
-- SSE runs over normal HTTP and the browser reconnects automatically if the connection drops. That makes it simpler to build and to run than WebSockets.
-
-**Endpoint:** `GET /api/v1/orders/:id/events`
-
-- Who can call it: the authenticated buyer who owns the order. Any other user gets `404 NOT_FOUND`.
-- Response: `200 OK` with `Content-Type: text/event-stream`. The connection stays open and the server sends an event each time the order changes.
-- The browser's built-in `EventSource` cannot send an `Authorization` header, so this endpoint accepts the login token through a secure cookie (or a short-lived token). The client must not put the normal login token in the URL.
-
-**Example event** sent when a seller marks an item as shipped:
-
-```
-event: order.item.shipped
-data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","itemId":"d5e6f7a8-b9c0-4d1e-a2f3-a4b5c6d7e8f9","itemStatus":"shipped","orderStatus":"paid"}
-```
-
-A second event is sent when the last item ships and the order itself changes:
-
-```
-event: order.status.changed
-data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","orderStatus":"shipped"}
-```
-
-**When I would switch to WebSockets:** if the product later needs two-way messaging, for example a live chat between buyer and seller, because then the client also needs to send messages to the server over the same connection.
-
-## Schema Proof
-
-This section proves the data model works. I implemented only the schema, then ran queries against it and tried to break it.
-
-The database is Postgres, running in Docker. Table and column names use `snake_case` (for example `stock_quantity`), while the design sections above use `camelCase`.
-
-### Files
-
-| File | What it does |
-|---|---|
-| `db/migrations/001_init.sql` | Creates the enums, 11 tables, constraints and indexes |
-| `db/seed.sql` | Loads a small dataset: 2 sellers, 2 buyers, 4 products with colours, 1 cart, 2 orders and 1 review |
-| `db/queries.sql` | One query for each of the five important actions |
-| `db/explain.sql` | Query plans for the two heaviest queries |
-| `db/invalid_inserts.sql` | Three invalid states the database must reject |
-
-### How to run it
-
-Start Postgres and create the database:
-
-```
-docker run --name fashion-db -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:16
-docker exec -it fashion-db psql -U postgres -c "CREATE DATABASE fashion_marketplace;"
-```
-
-Run each file (PowerShell):
-
-```
-Get-Content db\migrations\001_init.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
-Get-Content db\seed.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
-Get-Content db\queries.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
-Get-Content db\explain.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
-Get-Content db\invalid_inserts.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
-```
-
-`seed.sql` clears the tables first, so it can be run again at any time. To run `queries.sql` a second time, run `seed.sql` first.
-
-### The five queries
-
-Each query answers one of the five important actions.
-
-| Action | What the query does |
-|---|---|
-| 1. Seller lists a product | Inserts the product and its colours with stock in one transaction |
-| 2. Buyer browses products | Filters by category, audience and price, sorts by price, and paginates. Returns each colour's `inStock` and the total stock |
-| 3. Buyer adds a colour to the cart | Inserts the cart item, or adds to the quantity if it is already there. Only works if the colour exists and has stock |
-| 4. Buyer places an order | In one transaction: snapshots the cart, reduces stock only where enough is left, creates the order and order items with copied names and prices, and empties the cart |
-| 5. Seller ships an order item | In one transaction: locks the order, ships the seller's own item, and moves the order to `shipped` only if every item has shipped |
-
-Output of the five queries:
-
-![Output of the five queries](docs/screenshots/queries-output.png)
-
-### Query plans
-
-I checked the plans of the two heaviest queries: browsing products (Action 2) and the cart snapshot used when placing an order (Action 4).
-
-The test data has only a few rows, so Postgres would normally read the whole table instead of using an index. To show that my indexes can be used, `explain.sql` turns off sequential scans for the session with `SET enable_seqscan = off`. With real data volumes Postgres chooses the index on its own.
-
-**Browse products** uses the index `products_category_audience_idx`:
-
-![Query plan for browsing products](docs/screenshots/plan-browse.png)
-
-**Cart snapshot when placing an order** uses the index `cart_items_cart_colour_unique`:
-
-![Query plan for the cart snapshot](docs/screenshots/plan-cart-snapshot.png)
-
-### Invalid states the database rejects
-
-I tried three invalid actions. The database rejected each one.
-
-| # | Invalid state I tried | What stopped it | Real-world mistake it prevents |
-|---|---|---|---|
-| 1 | A second cart for the same buyer | Unique constraint `carts_user_id_unique` | A buyer with two carts, so items and totals get mixed up |
-| 2 | A product with a price of 0 | Check constraint `products_price_positive` | A seller listing a product for free by mistake |
-| 3 | Deleting a colour that appears in an order | Foreign key `order_items_product_colour_id_fkey` (`ON DELETE RESTRICT`) | Losing the record of what a buyer purchased |
-
-Screenshot of the three errors:
-
-![The three rejected invalid states](docs/screenshots/invalid-inserts.png)
-
-### What the schema makes impossible
-
-- A buyer cannot have two carts (`carts_user_id_unique`).
-- A colour cannot go below zero stock, even if two buyers order the last item at once (`product_colours_stock_not_negative`).
-- A purchased item cannot be reviewed twice (`reviews_order_item_unique`).
-- A colour used in an order cannot be hard-deleted (`ON DELETE RESTRICT`).
-- A seller cannot have two seller profiles (`sellers_user_id_unique`).
-- A product cannot have the same active colour twice (the partial unique index `product_colours_product_colour_unique`).
 
 ### POST /api/v1/orders/:id/payments
 
@@ -1340,3 +1146,198 @@ These follow the same conventions as the contracts above: the `data` and `meta` 
 | `GET /api/v1/orders/:id` | Buyer who owns the order | Returns one order with its items (including each item's status) and its payment attempts | 400 `VALIDATION_ERROR`, 401, 403, 404 | Yes, safe |
 | `GET /api/v1/seller/order-items` | Seller | Lists only the seller's own order items, using the `sellerId` copy on each item. Filter: `status`. Sort: `createdAt`. Shows the delivery address of paid orders only | 400 `VALIDATION_ERROR` (bad query), 401, 403 | Yes, safe |
 | `GET /api/v1/products/:id/reviews` | Public | Lists the reviews of a product, newest first. Each review shows `rating`, `comment`, `createdAt` and the buyer's first name only. `meta` also includes `averageRating` | 400 `VALIDATION_ERROR`, 404 (product not found or removed) | Yes, safe |
+
+### Over-fetching
+
+**Endpoint chosen:** `GET /api/v1/products` (the browse list).
+
+**The problem:** a product card on the browse page only needs the product's name, image and price. But each REST result also carries category, target audience, size, the full colours list and `totalStock`. A buyer scrolling through 20 products downloads all of that for every card, even though the card never shows most of it.
+
+**REST response (one item from the list)**
+
+```json
+{
+  "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
+  "name": "Large Tote Bag",
+  "imageUrl": "https://example.com/tote-bag.jpg",
+  "category": "bags",
+  "targetAudience": "women",
+  "price": 8500000,
+  "currency": "NGN",
+  "sizeOrDimensions": "Large",
+  "colours": [
+    { "colour": "Black", "inStock": false },
+    { "colour": "Blue", "inStock": true },
+    { "colour": "Green", "inStock": true }
+  ],
+  "totalStock": 8
+}
+```
+
+**GraphQL query for the same need:** the client asks only for the three fields the card shows.
+
+```graphql
+query {
+  products(limit: 20) {
+    id
+    name
+    imageUrl
+    price
+  }
+}
+```
+
+**What GraphQL would return**
+
+```json
+{
+  "data": {
+    "products": [
+      {
+        "id": "9d7f2a4e-7d3e-4f8a-9f2e-5a6d7c8b9e10",
+        "name": "Large Tote Bag",
+        "imageUrl": "https://example.com/tote-bag.jpg",
+        "price": 8500000
+      }
+    ]
+  }
+}
+```
+
+**When REST is still fine**
+
+- The extra fields are small. Each product adds only a few hundred bytes, so the saving is real but not large.
+- REST can already shrink the response without GraphQL, for example with a `?fields=name,imageUrl,price` query parameter.
+- REST is simpler to build, cache, document and test. This follows the class guidance that REST is the right choice for an MVP. GraphQL adds a schema, a resolver layer and harder caching, and a small team building a first version should not pay that cost early.
+
+**Decision:** use REST for the MVP. Switch to GraphQL when one of these happens:
+
+1. Several clients (web, mobile app, seller dashboard) need very different shapes of the same data, and adding a special endpoint or `fields` option for each becomes hard to maintain.
+2. One screen needs three or more separate requests to load, for example the product, its seller and its reviews, and the extra round trips make the page noticeably slow.
+
+The trigger is how many different clients and screens need different data shapes, not the number of users.
+
+### Real-time
+
+**Place chosen:** a buyer watches their order move from `paid` to `shipped` to `delivered` without refreshing the page or repeatedly asking the server.
+
+**Tool chosen:** Server-Sent Events (SSE).
+
+**Why SSE and not WebSockets**
+
+- SSE is one-directional: the server sends updates to the client. WebSockets are bidirectional: both sides can send messages at any time.
+- Here the buyer only listens. They send nothing back while watching the order, so two-way communication is not needed.
+- SSE runs over normal HTTP and the browser reconnects automatically if the connection drops. That makes it simpler to build and to run than WebSockets.
+
+**Endpoint:** `GET /api/v1/orders/:id/events`
+
+- Who can call it: the authenticated buyer who owns the order. Any other user gets `404 NOT_FOUND`.
+- Response: `200 OK` with `Content-Type: text/event-stream`. The connection stays open and the server sends an event each time the order changes.
+- The browser's built-in `EventSource` cannot send an `Authorization` header, so this endpoint accepts the login token through a secure cookie (or a short-lived token). The client must not put the normal login token in the URL.
+
+**Example event** sent when a seller marks an item as shipped:
+
+```
+event: order.item.shipped
+data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","itemId":"d5e6f7a8-b9c0-4d1e-a2f3-a4b5c6d7e8f9","itemStatus":"shipped","orderStatus":"paid"}
+```
+
+A second event is sent when the last item ships and the order itself changes:
+
+```
+event: order.status.changed
+data: {"orderId":"c4d5e6f7-a8b9-4c0d-91e2-f3a4b5c6d7e8","orderStatus":"shipped"}
+```
+
+**When I would switch to WebSockets:** if the product later needs two-way messaging, for example a live chat between buyer and seller, because then the client also needs to send messages to the server over the same connection.
+
+## Schema Proof
+
+This section proves the data model works. I implemented only the schema, then ran queries against it and tried to break it.
+
+The database is Postgres, running in Docker. Table and column names use `snake_case` (for example `stock_quantity`), while the design sections above use `camelCase`.
+
+### Files
+
+| File | What it does |
+|---|---|
+| `db/migrations/001_init.sql` | Creates the enums, 11 tables, constraints and indexes |
+| `db/seed.sql` | Loads a small dataset: 2 sellers, 2 buyers, 4 products with colours, 1 cart, 2 orders and 1 review |
+| `db/queries.sql` | One query for each of the five important actions |
+| `db/explain.sql` | Query plans for the two heaviest queries |
+| `db/invalid_inserts.sql` | Three invalid states the database must reject |
+
+### How to run it
+
+Start Postgres and create the database:
+
+```
+docker run --name fashion-db -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:16
+docker exec -it fashion-db psql -U postgres -c "CREATE DATABASE fashion_marketplace;"
+```
+
+Run each file (PowerShell):
+
+```
+Get-Content db\migrations\001_init.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\seed.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\queries.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\explain.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+Get-Content db\invalid_inserts.sql | docker exec -i fashion-db psql -U postgres -d fashion_marketplace
+```
+
+`seed.sql` clears the tables first, so it can be run again at any time. To run `queries.sql` a second time, run `seed.sql` first.
+
+### The five queries
+
+Each query answers one of the five important actions.
+
+| Action | What the query does |
+|---|---|
+| 1. Seller lists a product | Inserts the product and its colours with stock in one transaction |
+| 2. Buyer browses products | Filters by category, audience and price, sorts by price, and paginates. Returns each colour's `inStock` and the total stock |
+| 3. Buyer adds a colour to the cart | Inserts the cart item, or adds to the quantity if it is already there. Only works if the colour exists and has stock |
+| 4. Buyer places an order | In one transaction: snapshots the cart, reduces stock only where enough is left, creates the order and order items with copied names and prices, and empties the cart |
+| 5. Seller ships an order item | In one transaction: locks the order, ships the seller's own item, and moves the order to `shipped` only if every item has shipped |
+
+Output of the five queries:
+
+![Output of the five queries](docs/screenshots/queries-output.png)
+
+### Query plans
+
+I checked the plans of the two heaviest queries: browsing products (Action 2) and the cart snapshot used when placing an order (Action 4).
+
+The test data has only a few rows, so Postgres would normally read the whole table instead of using an index. To show that my indexes can be used, `explain.sql` turns off sequential scans for the session with `SET enable_seqscan = off`. With real data volumes Postgres chooses the index on its own.
+
+**Browse products** uses the index `products_category_audience_idx`:
+
+![Query plan for browsing products](docs/screenshots/plan-browse.png)
+
+**Cart snapshot when placing an order** uses the index `cart_items_cart_colour_unique`:
+
+![Query plan for the cart snapshot](docs/screenshots/plan-cart-snapshot.png)
+
+### Invalid states the database rejects
+
+I tried three invalid actions. The database rejected each one.
+
+| # | Invalid state I tried | What stopped it | Real-world mistake it prevents |
+|---|---|---|---|
+| 1 | A second cart for the same buyer | Unique constraint `carts_user_id_unique` | A buyer with two carts, so items and totals get mixed up |
+| 2 | A product with a price of 0 | Check constraint `products_price_positive` | A seller listing a product for free by mistake |
+| 3 | Deleting a colour that appears in an order | Foreign key `order_items_product_colour_id_fkey` (`ON DELETE RESTRICT`) | Losing the record of what a buyer purchased |
+
+Screenshot of the three errors:
+
+![The three rejected invalid states](docs/screenshots/invalid-inserts.png)
+
+### What the schema makes impossible
+
+- A buyer cannot have two carts (`carts_user_id_unique`).
+- A colour cannot go below zero stock, even if two buyers order the last item at once (`product_colours_stock_not_negative`).
+- A purchased item cannot be reviewed twice (`reviews_order_item_unique`).
+- A colour used in an order cannot be hard-deleted (`ON DELETE RESTRICT`).
+- A seller cannot have two seller profiles (`sellers_user_id_unique`).
+- A product cannot have the same active colour twice (the partial unique index `product_colours_product_colour_unique`).
+
